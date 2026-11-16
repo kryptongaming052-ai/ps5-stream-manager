@@ -165,6 +165,7 @@ def playlist():
                     continue
                 raise
         return {"playlist_id": pid, "created": created, "already_in_playlist": False, "item": item}
+    return run(f)
 
 PAGE = """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
 <title>PS5 Stream Manager</title>
@@ -187,6 +188,7 @@ overflow:auto;font-size:.75rem;white-space:pre-wrap;word-break:break-word}.s{col
 <button onclick="go('/api/playlist',{name:p.value})">6. Find/create playlist + add video</button>
 <pre id=o>Output…</pre>
 <script>
-async function go(u,b){o.textContent='Working…';const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});o.textContent=JSON.stringify(await r.json(),null,2)}
-async function up(){const d=new FormData();d.append('file',f.files[0]);o.textContent='Working…';const r=await fetch('/api/thumbnail',{method:'POST',body:d});o.textContent=JSON.stringify(await r.json(),null,2)}
+async function show(r){const x=await r.text();try{o.textContent=JSON.stringify(JSON.parse(x),null,2)}catch(e){o.textContent='Server error '+r.status+':\\n'+x.slice(0,600)}}
+async function go(u,b){o.textContent='Working…';try{show(await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})}))}catch(e){o.textContent='Network error: '+e}}
+async function up(){const d=new FormData();d.append('file',f.files[0]);o.textContent='Working…';try{show(await fetch('/api/thumbnail',{method:'POST',body:d}))}catch(e){o.textContent='Network error: '+e}}
 </script>{% endif %}"""
