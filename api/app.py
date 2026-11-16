@@ -1,6 +1,7 @@
 """PS5 Stream Manager - Stage 2: game library + one-tap Apply."""
 import os, io, json, time
 from functools import wraps
+from datetime import timedelta
 from flask import Flask, session, redirect, request, jsonify, render_template_string, Response
 from cryptography.fernet import Fernet
 from google_auth_oauthlib.flow import Flow
@@ -13,7 +14,8 @@ from psycopg.rows import dict_row
 
 app = Flask(__name__)
 app.secret_key = os.environ["SECRET_KEY"]
-app.config.update(SESSION_COOKIE_SECURE=True, SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
+app.config.update(SESSION_COOKIE_SECURE=True, SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax",
+                  PERMANENT_SESSION_LIFETIME=timedelta(days=365))
 fernet = Fernet(os.environ["FERNET_KEY"])
 BASE = os.environ["BASE_URL"].rstrip("/")
 OWNER = os.environ["OWNER_EMAIL"].lower()
@@ -80,6 +82,7 @@ def callback():
         session.clear(); return "This app is private.", 403
     if not c.refresh_token:
         return "No refresh token returned. Revoke app access in your Google account and sign in again.", 400
+    session.permanent = True
     session["t"] = fernet.encrypt(json.dumps({"token": c.token, "refresh_token": c.refresh_token}).encode()).decode()
     return redirect("/")
 
@@ -132,7 +135,14 @@ def add_item(y, pid, vid):
         try:
             return y.playlistItems().insert(part="snippet", body=body).execute()
         except HttpError as e:
-            if e.resp.status == 404 and a < 3: time.sleep(2); continue
+            if e.resp.status in (404, 409) and a < 3:
+                time.sleep(2 + a * 2)
+                try:
+                    r = y.playlistItems().list(part="snippet", playlistId=pid, videoId=vid, maxResults=1).execute()
+                    if r.get("items"): return "added-despite-error"
+                except HttpError:
+                    pass
+                continue
             raise
 
 @app.post("/api/apply")
@@ -247,7 +257,7 @@ input[type=text],input[type=number],input[type=file]{width:100%;box-sizing:borde
 input[type=number]{width:90px}.card{display:flex;gap:12px;align-items:center;background:#181b25;border-radius:14px;padding:10px;margin:10px 0}
 .card img{width:96px;border-radius:8px}.card div{display:flex;flex-direction:column;gap:4px}.pv{width:100%;border-radius:12px;background:#181b25;min-height:60px}
 .s{color:#9aa}.warn{color:#f5b041}ul{padding:0}li{margin:6px 0;list-style:none}label{display:flex;gap:8px;align-items:center;margin:10px 0}
-pre{white-space:pre-wrap}</style>{{ body|safe }}"""
+pre{white-space:pre-wrap}.row{display:flex;gap:8px}.row button{flex:1}.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}.grid img{width:100%;border-radius:8px}</style>{{ body|safe }}"""
 
 HOME = r"""<h1>PS5 Stream Manager</h1>
 {% if signed_in %}<a class=big href=/new>New Game</a><a class=big href=/games>Existing Game</a><a class=s href=/logout>Sign out</a>
@@ -261,30 +271,54 @@ GAMES = r"""<a class=s href=/>← Home</a><h1>Your games</h1>
 NEW = r"""<a class=s href={{ '/game/'~game.id if game else '/' }}>← Back</a>
 <h1>{{ 'Add thumbnails: '~game.name if game else 'New game' }}</h1>
 {% if not game %}<input type=text id=n placeholder="Game name">{% endif %}
+<div class=row><button class=b2 onclick="tab(1)">From one image</button><button class=b2 onclick="tab(2)">Existing images</button></div>
+<div id=m1>
+<p class=s>Pick one base image. The app stamps PART - 1, PART - 2 … and FINAL PART on the last one.</p>
+<input type=file id=bf accept="image/png,image/jpeg,image/webp">
+<label>How many parts? <input type=number id=np min=1 max=200 value=10></label>
+<button onclick=gen()>Generate preview</button>
+<div id=pv class=grid></div>
+<button id=sv style="display:none" onclick=saveGen()>Looks good, save all</button>
+</div>
+<div id=m2 style="display:none">
+<p class=s>Select the images from your folder (part-1, part-2 … final-part).</p>
 <input type=file id=f accept="image/png,image/jpeg" multiple>
-<p class=s id=l style="white-space:pre-line">Select all images from the game folder (part-1, part-2 … final-part).</p>
-<button id=b onclick=save()>Save</button><pre id=o></pre>
+<p class=s id=l style="white-space:pre-line"></p>
+<button id=b onclick=save()>Save</button>
+</div>
+<pre id=o></pre>
 <script>
-let gid={{ game.id if game else 'null' }};
-function parse(n){n=n.toLowerCase();if(n.includes('final'))return'final';const m=n.match(/(\d+)/);return m?String(+m[1]):null}
+let gid={{ game.id if game else 'null' }},items=[];
+function tab(k){m1.style.display=k==1?'':'none';m2.style.display=k==2?'':'none'}
+function parse(s){s=s.toLowerCase();if(s.includes('final'))return'final';const m=s.match(/(\d+)/);return m?String(+m[1]):null}
 f.onchange=()=>{l.textContent=[...f.files].map(x=>{const p=parse(x.name);return x.name+' → '+(p?(p=='final'?'Final Part':'Part '+p):'skipped (no part number)')}).join('\n')};
-async function toJpeg(file){const bmp=await createImageBitmap(file),c=document.createElement('canvas');c.width=1280;c.height=720;
-const s=Math.max(1280/bmp.width,720/bmp.height),w=bmp.width*s,h=bmp.height*s;c.getContext('2d').drawImage(bmp,(1280-w)/2,(720-h)/2,w,h);
-return new Promise(r=>c.toBlob(r,'image/jpeg',.88))}
-async function save(){
- const files=[...f.files].map(x=>[parse(x.name),x]).filter(a=>a[0]);
- if(!files.length){o.textContent='Pick at least one valid image';return}
- b.disabled=true;
- try{
-  if(!gid){const nm=n.value.trim();if(!nm)throw 'Enter a game name';
-   const r=await(await fetch('/api/games',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:nm})})).json();
-   if(!r.ok)throw r.error;gid=r.id}
-  let i=0;for(const [p,x] of files){o.textContent='Uploading '+(++i)+'/'+files.length+'…';
-   const d=new FormData();d.append('part',p);d.append('file',await toJpeg(x),'t.jpg');
-   const r=await(await fetch('/api/games/'+gid+'/thumb',{method:'POST',body:d})).json();if(!r.ok)throw r.error}
-  location='/game/'+gid
- }catch(e){o.textContent='Error: '+e;b.disabled=false}
-}
+function stamp(bmp,text){const c=document.createElement('canvas');c.width=1280;c.height=720;const x=c.getContext('2d');
+ const s=Math.max(1280/bmp.width,720/bmp.height),w=bmp.width*s,h=bmp.height*s;x.drawImage(bmp,(1280-w)/2,(720-h)/2,w,h);
+ if(text){const fs=Math.round(1280*.055),sw=Math.max(2,Math.round(fs*.08));
+  x.font='bold '+fs+'px Arial,Helvetica,sans-serif';x.textBaseline='top';x.lineJoin='round';
+  const px=1280-Math.round(1280*.03)-x.measureText(text).width,py=Math.round(720*.03);
+  x.lineWidth=sw*2;x.strokeStyle='#000';x.strokeText(text,px,py);x.fillStyle='#fff';x.fillText(text,px,py)}
+ return new Promise(r=>c.toBlob(r,'image/jpeg',.88))}
+async function ensure(){if(gid)return gid;const nm=n.value.trim();if(!nm)throw 'Enter a game name';
+ const r=await(await fetch('/api/games',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:nm})})).json();
+ if(!r.ok)throw r.error;gid=r.id;return gid}
+async function up(list){const id=await ensure();let i=0;
+ for(const [p,x] of list){o.textContent='Uploading '+(++i)+'/'+list.length+'…';
+  const d=new FormData();d.append('part',p);d.append('file',x,'t.jpg');
+  const r=await(await fetch('/api/games/'+id+'/thumb',{method:'POST',body:d})).json();if(!r.ok)throw r.error}
+ location='/game/'+id}
+async function gen(){const file=bf.files[0],N=+np.value;
+ if(!file||!(N>=1&&N<=200)){o.textContent='Choose an image and a part count (1-200)';return}
+ o.textContent='Generating…';pv.innerHTML='';sv.style.display='none';items=[];
+ const bmp=await createImageBitmap(file);
+ for(let i=1;i<=N;i++){const last=i==N,blob=await stamp(bmp,last?'FINAL PART':'PART - '+i);
+  items.push([last?'final':String(i),blob]);const im=document.createElement('img');im.src=URL.createObjectURL(blob);pv.appendChild(im)}
+ o.textContent=N+' thumbnails ready. Check them, then save.';sv.style.display='block'}
+async function saveGen(){sv.disabled=true;try{await up(items)}catch(e){o.textContent='Error: '+e;sv.disabled=false}}
+async function save(){const fl=[...f.files].map(x=>[parse(x.name),x]).filter(a=>a[0]);
+ if(!fl.length){o.textContent='Pick at least one valid image';return}
+ b.disabled=true;try{const list=[];for(const [p,x] of fl)list.push([p,await stamp(await createImageBitmap(x),null)]);await up(list)}
+ catch(e){o.textContent='Error: '+e;b.disabled=false}}
 </script>"""
 
 GAME = r"""<a class=s href=/games>← Games</a><h1>{{game.name}}</h1>
