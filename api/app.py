@@ -1,14 +1,15 @@
-"""Stage 1: Google sign-in + PS5 compatibility test page. Nothing is faked:
-every button returns the raw YouTube API response or the raw error."""
+"""PS5 Stream Manager - Stage 2: game library + one-tap Apply."""
 import os, io, json, time
-from flask import Flask, session, redirect, request, jsonify, render_template_string
+from functools import wraps
+from flask import Flask, session, redirect, request, jsonify, render_template_string, Response
 from cryptography.fernet import Fernet
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseUpload
-import requests as rq
+import requests as rq, psycopg
+from psycopg.rows import dict_row
 
 app = Flask(__name__)
 app.secret_key = os.environ["SECRET_KEY"]
@@ -16,33 +17,51 @@ app.config.update(SESSION_COOKIE_SECURE=True, SESSION_COOKIE_HTTPONLY=True, SESS
 fernet = Fernet(os.environ["FERNET_KEY"])
 BASE = os.environ["BASE_URL"].rstrip("/")
 OWNER = os.environ["OWNER_EMAIL"].lower()
-SCOPES = ["openid", "https://www.googleapis.com/auth/userinfo.email",
-          "https://www.googleapis.com/auth/youtube"]
-CFG = {"web": {"client_id": os.environ["GOOGLE_CLIENT_ID"],
-               "client_secret": os.environ["GOOGLE_CLIENT_SECRET"],
-               "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-               "token_uri": "https://oauth2.googleapis.com/token"}}
+DB = os.environ.get("DATABASE_URL") or os.environ["POSTGRES_URL"]
+SCOPES = ["openid", "https://www.googleapis.com/auth/userinfo.email", "https://www.googleapis.com/auth/youtube"]
+CFG = {"web": {"client_id": os.environ["GOOGLE_CLIENT_ID"], "client_secret": os.environ["GOOGLE_CLIENT_SECRET"],
+               "auth_uri": "https://accounts.google.com/o/oauth2/auth", "token_uri": "https://oauth2.googleapis.com/token"}}
 
+SCHEMA = """
+create table if not exists games(id serial primary key, name text unique not null, playlist_id text,
+  next_part int not null default 1, last_done int not null default 0);
+create table if not exists thumbs(game_id int references games(id) on delete cascade, part text not null,
+  data bytea not null, primary key(game_id, part));
+create table if not exists processed(video_id text primary key, game_id int references games(id) on delete cascade,
+  label text, at timestamptz default now());
+"""
+_ready = False
+
+def conn():
+    global _ready
+    c = psycopg.connect(DB, row_factory=dict_row, prepare_threshold=None)
+    if not _ready:
+        c.execute(SCHEMA); c.commit(); _ready = True
+    return c
+
+def q(sql, args=(), mode=None):
+    with conn() as c:
+        cur = c.execute(sql, args)
+        if mode == "one": return cur.fetchone()
+        if mode == "all": return cur.fetchall()
+
+# ---------- auth ----------
 def flow():
-    return Flow.from_client_config(CFG, SCOPES, redirect_uri=BASE + "/oauth2callback",
-                                   autogenerate_code_verifier=False)
+    return Flow.from_client_config(CFG, SCOPES, redirect_uri=BASE + "/oauth2callback", autogenerate_code_verifier=False)
 
 def yt():
-    t = session.get("t")
-    if not t:
-        return None
-    d = json.loads(fernet.decrypt(t.encode()))
+    d = json.loads(fernet.decrypt(session["t"].encode()))
     c = Credentials(d["token"], refresh_token=d["refresh_token"], token_uri=CFG["web"]["token_uri"],
                     client_id=CFG["web"]["client_id"], client_secret=CFG["web"]["client_secret"], scopes=SCOPES)
     return build("youtube", "v3", credentials=c, cache_discovery=False)
 
-def run(fn):
-    try:
-        return jsonify(ok=True, result=fn())
-    except HttpError as e:
-        return jsonify(ok=False, status=e.resp.status, error=e.content.decode(errors="replace")), 200
-    except Exception as e:
-        return jsonify(ok=False, error=repr(e)), 200
+def need(f):
+    @wraps(f)
+    def w(*a, **k):
+        if not session.get("t"):
+            return (jsonify(ok=False, error="Not signed in"), 401) if request.path.startswith("/api") else redirect("/")
+        return f(*a, **k)
+    return w
 
 @app.get("/login")
 def login():
@@ -55,140 +74,240 @@ def callback():
     f = flow()
     f.fetch_token(authorization_response=request.url.replace("http://", "https://"))
     c = f.credentials
-    email = rq.get("https://www.googleapis.com/oauth2/v3/userinfo",
-                   headers={"Authorization": f"Bearer {c.token}"}, timeout=10).json().get("email", "").lower()
+    email = rq.get("https://www.googleapis.com/oauth2/v3/userinfo", headers={"Authorization": f"Bearer {c.token}"},
+                   timeout=10).json().get("email", "").lower()
     if email != OWNER:
-        session.clear()
-        return "This app is private.", 403
+        session.clear(); return "This app is private.", 403
     if not c.refresh_token:
         return "No refresh token returned. Revoke app access in your Google account and sign in again.", 400
     session["t"] = fernet.encrypt(json.dumps({"token": c.token, "refresh_token": c.refresh_token}).encode()).decode()
-    return redirect("/debug")
+    return redirect("/")
 
 @app.get("/logout")
 def logout():
-    session.clear()
-    return redirect("/")
+    session.clear(); return redirect("/")
+
+# ---------- YouTube helpers ----------
+class Fail(Exception): pass
+
+def yerr(e):
+    try:
+        j = json.loads(e.content)["error"]
+        if j.get("errors", [{}])[0].get("reason") in ("quotaExceeded", "dailyLimitExceeded"):
+            return "YouTube API quota exceeded, try again tomorrow"
+        return f"{e.resp.status}: {j['message']}"
+    except Exception:
+        return str(e.resp.status)
+
+def mk_title(name, n, final):
+    s = " | PS5 Pro Gameplay | " + ("Final Part" if final else f"Part-{n}")
+    return name[:100 - len(s)] + s
+
+def get_playlist(y, g):
+    if g["playlist_id"]:
+        if y.playlists().list(part="id", id=g["playlist_id"]).execute().get("items"):
+            return g["playlist_id"]
+    tok = None
+    while True:
+        r = y.playlists().list(part="id,snippet", mine=True, maxResults=50, pageToken=tok).execute()
+        for p in r["items"]:
+            if p["snippet"]["title"] == g["name"]: return p["id"]
+        tok = r.get("nextPageToken")
+        if not tok: break
+    return y.playlists().insert(part="snippet,status", body={"snippet": {"title": g["name"]},
+                                "status": {"privacyStatus": "public"}}).execute()["id"]
+
+def add_item(y, pid, vid):
+    tok = None
+    try:
+        while True:
+            r = y.playlistItems().list(part="snippet", playlistId=pid, maxResults=50, pageToken=tok).execute()
+            if any(i["snippet"]["resourceId"]["videoId"] == vid for i in r["items"]): return "duplicate"
+            tok = r.get("nextPageToken")
+            if not tok: break
+    except HttpError as e:
+        if e.resp.status != 404: raise
+    body = {"snippet": {"playlistId": pid, "resourceId": {"kind": "youtube#video", "videoId": vid}}}
+    for a in range(4):
+        try:
+            return y.playlistItems().insert(part="snippet", body=body).execute()
+        except HttpError as e:
+            if e.resp.status == 404 and a < 3: time.sleep(2); continue
+            raise
+
+@app.post("/api/apply")
+@need
+def apply():
+    d, steps = request.json or {}, []
+    def S(name, fn):
+        try: r = fn()
+        except HttpError as e:
+            steps.append({"name": name, "ok": False}); raise Fail(f"{name} failed ({yerr(e)})")
+        steps.append({"name": name, "ok": True}); return r
+    try:
+        g = q("select * from games where id=%s", (int(d.get("id", 0)),), "one")
+        if not g: raise Fail("Game not found")
+        final = bool(d.get("final")); n = int(d.get("part") or g["next_part"])
+        part, label = ("final", "Final Part") if final else (str(n), f"Part-{n}")
+        y = yt()
+        def detect():
+            b = (y.liveBroadcasts().list(part="id,snippet,status", broadcastStatus="active", maxResults=1)
+                 .execute().get("items") or [None])[0]
+            if not b: raise Fail("No active livestream found. Start the stream on your PS5 first.")
+            return b
+        b = S("Detect active livestream", detect); vid = b["id"]
+        if q("select 1 from processed where video_id=%s", (vid,), "one"):
+            return jsonify(ok=True, already=True, steps=steps, message="This livestream was already processed. Nothing changed.")
+        row = q("select data from thumbs where game_id=%s and part=%s", (g["id"], part), "one")
+        if not row: raise Fail(f"No thumbnail saved for {label}. Add it first, nothing was changed.")
+        sn, title = b["snippet"], mk_title(g["name"], n, final)
+        S("Update title", lambda: y.liveBroadcasts().update(part="snippet", body={"id": vid, "snippet": {
+            "title": title, "description": sn.get("description", ""), "scheduledStartTime": sn["scheduledStartTime"]}}).execute())
+        S("Upload thumbnail", lambda: y.thumbnails().set(videoId=vid, media_body=MediaIoBaseUpload(
+            io.BytesIO(bytes(row["data"])), mimetype="image/jpeg")).execute())
+        pid = S("Find or create playlist", lambda: get_playlist(y, g))
+        S("Add to playlist", lambda: add_item(y, pid, vid))
+        with conn() as c:
+            c.execute("insert into processed(video_id,game_id,label) values(%s,%s,%s)", (vid, g["id"], label))
+            c.execute("update games set playlist_id=%s, last_done=case when %s then last_done else %s end, "
+                      "next_part=case when %s then next_part else %s end where id=%s",
+                      (pid, final, n, final, n + 1, g["id"]))
+        return jsonify(ok=True, steps=steps, message=f"Done: {title}")
+    except Fail as e:
+        return jsonify(ok=False, steps=steps, error=str(e))
+    except Exception as e:
+        msg = "Session expired, sign in again" if "invalid_grant" in repr(e) or "RefreshError" in repr(e) else repr(e)
+        return jsonify(ok=False, steps=steps, error=msg)
+
+# ---------- games API ----------
+@app.post("/api/games")
+@need
+def add_game():
+    name = ((request.json or {}).get("name") or "").strip()
+    if not name: return jsonify(ok=False, error="Enter a game name")
+    try:
+        return jsonify(ok=True, id=q("insert into games(name) values(%s) returning id", (name,), "one")["id"])
+    except psycopg.errors.UniqueViolation:
+        return jsonify(ok=False, error="A game with that name already exists")
+
+@app.post("/api/games/<int:gid>/thumb")
+@need
+def add_thumb(gid):
+    part, f = request.form.get("part", ""), request.files.get("file")
+    if not f or not (part == "final" or part.isdigit()): return jsonify(ok=False, error="Bad upload")
+    q("insert into thumbs(game_id,part,data) values(%s,%s,%s) on conflict(game_id,part) do update set data=excluded.data",
+      (gid, part, f.read()))
+    return jsonify(ok=True)
+
+@app.post("/api/games/<int:gid>/delete")
+@need
+def del_game(gid):
+    q("delete from games where id=%s", (gid,))  # thumbs + processed rows cascade
+    return jsonify(ok=True)
+
+@app.get("/thumb/<int:gid>/<part>")
+@need
+def thumb(gid, part):
+    r = q("select data from thumbs where game_id=%s and part=%s", (gid, part), "one")
+    if not r: return "", 404
+    return Response(bytes(r["data"]), mimetype="image/jpeg", headers={"Cache-Control": "private, max-age=60"})
+
+# ---------- pages ----------
+def page(tpl, **kw):
+    return render_template_string(BASE_HTML, body=render_template_string(tpl, **kw))
 
 @app.get("/")
 def home():
-    return render_template_string(PAGE, signed_in=bool(session.get("t")), debug=False)
+    return page(HOME, signed_in=bool(session.get("t")))
 
-@app.get("/debug")
-def debug():
-    if not session.get("t"):
-        return redirect("/")
-    return render_template_string(PAGE, signed_in=True, debug=True)
+@app.get("/games")
+@need
+def games():
+    rows = q("select g.*, (select count(*) from thumbs t where t.game_id=g.id) c from games g order by lower(name)", (), "all")
+    return page(GAMES, games=rows)
 
-def active_broadcast(y):
-    r = y.liveBroadcasts().list(part="id,snippet,status,contentDetails", broadcastStatus="active", maxResults=5).execute()
-    return r, (r.get("items") or [None])[0]
+@app.get("/new")
+@need
+def new():
+    gid = request.args.get("id", type=int)
+    return page(NEW, game=q("select * from games where id=%s", (gid,), "one") if gid else None)
 
-@app.post("/api/detect")
-def detect():
-    def f():
-        y = yt()
-        r, b = active_broadcast(y)
-        # Diagnostic: also list recent broadcasts so we can see how PS5 streams are classified
-        allb = y.liveBroadcasts().list(part="id,snippet,status", mine=True, maxResults=5).execute()
-        return {"active_found": bool(b), "active_response": r,
-                "recent_broadcasts_diagnostic": [
-                    {"id": i["id"], "title": i["snippet"]["title"], "lifeCycleStatus": i["status"]["lifeCycleStatus"]}
-                    for i in allb.get("items", [])]}
-    return run(f)
+@app.get("/game/<int:gid>")
+@need
+def game(gid):
+    g = q("select * from games where id=%s", (gid,), "one")
+    return page(GAME, game=g) if g else redirect("/games")
 
-@app.post("/api/video-id")
-def video_id():
-    def f():
-        _, b = active_broadcast(yt())
-        if not b: raise Exception("No active broadcast")
-        v = yt().videos().list(part="id,snippet,liveStreamingDetails,status", id=b["id"]).execute()
-        return {"broadcast_id": b["id"], "video_found_with_same_id": bool(v.get("items")), "video": v}
-    return run(f)
-
-@app.post("/api/title")
-def title():
-    new = (request.json or {}).get("title", "").strip()[:100]
-    def f():
-        if not new: raise Exception("Enter a title")
-        y = yt(); _, b = active_broadcast(y)
-        if not b: raise Exception("No active broadcast")
-        sn = b["snippet"]
-        body = {"id": b["id"], "snippet": {"title": new, "description": sn.get("description", ""),
-                                           "scheduledStartTime": sn["scheduledStartTime"]}}
-        return y.liveBroadcasts().update(part="snippet", body=body).execute()
-    return run(f)
-
-@app.post("/api/thumbnail")
-def thumb():
-    def f():
-        file = request.files.get("file")
-        if not file: raise Exception("Choose an image")
-        y = yt(); _, b = active_broadcast(y)
-        if not b: raise Exception("No active broadcast")
-        m = MediaIoBaseUpload(io.BytesIO(file.read()), mimetype=file.mimetype or "image/jpeg")
-        return y.thumbnails().set(videoId=b["id"], media_body=m).execute()
-    return run(f)
-
-@app.post("/api/playlist")
-def playlist():
-    name = (request.json or {}).get("name", "").strip()
-    def f():
-        if not name: raise Exception("Enter a playlist name")
-        y = yt(); _, b = active_broadcast(y)
-        if not b: raise Exception("No active broadcast")
-        pid, created, tok = None, False, None
-        while not pid:
-            r = y.playlists().list(part="id,snippet", mine=True, maxResults=50, pageToken=tok).execute()
-            pid = next((p["id"] for p in r["items"] if p["snippet"]["title"] == name), None)
-            tok = r.get("nextPageToken")
-            if not tok: break
-        if not pid:
-            pid = y.playlists().insert(part="snippet,status", body={"snippet": {"title": name},
-                  "status": {"privacyStatus": "public"}}).execute()["id"]
-            created = True
-        tok, dup = None, False
-        while not created:
-            r = y.playlistItems().list(part="snippet", playlistId=pid, maxResults=50, pageToken=tok).execute()
-            if any(i["snippet"]["resourceId"]["videoId"] == b["id"] for i in r["items"]): dup = True; break
-            tok = r.get("nextPageToken")
-            if not tok: break
-        if dup: return {"playlist_id": pid, "created": created, "already_in_playlist": True}
-        body = {"snippet": {"playlistId": pid, "resourceId": {"kind": "youtube#video", "videoId": b["id"]}}}
-        for attempt in range(4):
-            try:
-                item = y.playlistItems().insert(part="snippet", body=body).execute()
-                break
-            except HttpError as e:
-                if e.resp.status == 404 and created and attempt < 3:
-                    time.sleep(2)
-                    continue
-                raise
-        return {"playlist_id": pid, "created": created, "already_in_playlist": False, "item": item}
-    return run(f)
-
-PAGE = """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
-<title>PS5 Stream Manager</title>
+BASE_HTML = r"""<!doctype html><meta name=viewport content="width=device-width,initial-scale=1"><title>PS5 Stream Manager</title>
 <style>:root{color-scheme:dark}body{font-family:system-ui;background:#0e1016;color:#e8eaf0;max-width:640px;margin:0 auto;padding:20px}
-h1{font-size:1.3rem}button,a.b{display:block;width:100%;box-sizing:border-box;text-align:center;background:#6c5ce7;color:#fff;border:0;
-border-radius:12px;padding:14px;margin:8px 0;font-size:1rem;text-decoration:none}input{width:100%;box-sizing:border-box;padding:12px;
-border-radius:10px;border:1px solid #333;background:#181b25;color:#fff;margin:6px 0}pre{background:#181b25;padding:12px;border-radius:10px;
-overflow:auto;font-size:.75rem;white-space:pre-wrap;word-break:break-word}.s{color:#9aa}</style>
-<h1>PS5 Stream Manager · Stage 1</h1>
-{% if not signed_in %}<a class=b href=/login>Sign in with Google</a>
-{% elif not debug %}<a class=b href=/debug>Open compatibility test</a><a class=b href=/logout>Sign out</a>
-{% else %}<p class=s>Start a stream from the PS5 first, then run steps in order. Raw responses appear below.</p>
-<button onclick="go('/api/detect')">1-2. Detect active broadcast</button>
-<button onclick="go('/api/video-id')">3. Get video ID</button>
-<input id=t placeholder="Test title (e.g. TEST | PS5 Pro Gameplay | Part 1)">
-<button onclick="go('/api/title',{title:t.value})">4. Update title</button>
-<input id=f type=file accept="image/jpeg,image/png">
-<button onclick="up()">5. Upload thumbnail</button>
-<input id=p placeholder="Test playlist name">
-<button onclick="go('/api/playlist',{name:p.value})">6. Find/create playlist + add video</button>
-<pre id=o>Output…</pre>
+h1{font-size:1.4rem}a{color:inherit;text-decoration:none}
+.big,button,.b2{display:block;width:100%;box-sizing:border-box;text-align:center;background:#6c5ce7;color:#fff;border:0;border-radius:14px;padding:16px;margin:10px 0;font-size:1.05rem;cursor:pointer}
+.big{padding:30px;font-size:1.3rem}button:disabled{opacity:.5}.del{background:#c0392b}.b2{background:#2d3142}
+input[type=text],input[type=number],input[type=file]{width:100%;box-sizing:border-box;padding:12px;border-radius:10px;border:1px solid #333;background:#181b25;color:#fff;margin:6px 0}
+input[type=number]{width:90px}.card{display:flex;gap:12px;align-items:center;background:#181b25;border-radius:14px;padding:10px;margin:10px 0}
+.card img{width:96px;border-radius:8px}.card div{display:flex;flex-direction:column;gap:4px}.pv{width:100%;border-radius:12px;background:#181b25;min-height:60px}
+.s{color:#9aa}.warn{color:#f5b041}ul{padding:0}li{margin:6px 0;list-style:none}label{display:flex;gap:8px;align-items:center;margin:10px 0}
+pre{white-space:pre-wrap}</style>{{ body|safe }}"""
+
+HOME = r"""<h1>PS5 Stream Manager</h1>
+{% if signed_in %}<a class=big href=/new>New Game</a><a class=big href=/games>Existing Game</a><a class=s href=/logout>Sign out</a>
+{% else %}<a class=big href=/login>Sign in with Google</a>{% endif %}"""
+
+GAMES = r"""<a class=s href=/>← Home</a><h1>Your games</h1>
+{% for g in games %}<a class=card href=/game/{{g.id}}><img src=/thumb/{{g.id}}/{{g.next_part}} onerror="this.style.display='none'">
+<div><b>{{g.name}}</b><span class=s>Next: Part-{{g.next_part}} · {{g.c}} thumbnails</span></div></a>
+{% else %}<p class=s>No games yet.</p>{% endfor %}"""
+
+NEW = r"""<a class=s href={{ '/game/'~game.id if game else '/' }}>← Back</a>
+<h1>{{ 'Add thumbnails: '~game.name if game else 'New game' }}</h1>
+{% if not game %}<input type=text id=n placeholder="Game name">{% endif %}
+<input type=file id=f accept="image/png,image/jpeg" multiple>
+<p class=s id=l style="white-space:pre-line">Select all images from the game folder (part-1, part-2 … final-part).</p>
+<button id=b onclick=save()>Save</button><pre id=o></pre>
 <script>
-async function show(r){const x=await r.text();try{o.textContent=JSON.stringify(JSON.parse(x),null,2)}catch(e){o.textContent='Server error '+r.status+':\\n'+x.slice(0,600)}}
-async function go(u,b){o.textContent='Working…';try{show(await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})}))}catch(e){o.textContent='Network error: '+e}}
-async function up(){const d=new FormData();d.append('file',f.files[0]);o.textContent='Working…';try{show(await fetch('/api/thumbnail',{method:'POST',body:d}))}catch(e){o.textContent='Network error: '+e}}
-</script>{% endif %}"""
+let gid={{ game.id if game else 'null' }};
+function parse(n){n=n.toLowerCase();if(n.includes('final'))return'final';const m=n.match(/(\d+)/);return m?String(+m[1]):null}
+f.onchange=()=>{l.textContent=[...f.files].map(x=>{const p=parse(x.name);return x.name+' → '+(p?(p=='final'?'Final Part':'Part '+p):'skipped (no part number)')}).join('\n')};
+async function toJpeg(file){const bmp=await createImageBitmap(file),c=document.createElement('canvas');c.width=1280;c.height=720;
+const s=Math.max(1280/bmp.width,720/bmp.height),w=bmp.width*s,h=bmp.height*s;c.getContext('2d').drawImage(bmp,(1280-w)/2,(720-h)/2,w,h);
+return new Promise(r=>c.toBlob(r,'image/jpeg',.88))}
+async function save(){
+ const files=[...f.files].map(x=>[parse(x.name),x]).filter(a=>a[0]);
+ if(!files.length){o.textContent='Pick at least one valid image';return}
+ b.disabled=true;
+ try{
+  if(!gid){const nm=n.value.trim();if(!nm)throw 'Enter a game name';
+   const r=await(await fetch('/api/games',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:nm})})).json();
+   if(!r.ok)throw r.error;gid=r.id}
+  let i=0;for(const [p,x] of files){o.textContent='Uploading '+(++i)+'/'+files.length+'…';
+   const d=new FormData();d.append('part',p);d.append('file',await toJpeg(x),'t.jpg');
+   const r=await(await fetch('/api/games/'+gid+'/thumb',{method:'POST',body:d})).json();if(!r.ok)throw r.error}
+  location='/game/'+gid
+ }catch(e){o.textContent='Error: '+e;b.disabled=false}
+}
+</script>"""
+
+GAME = r"""<a class=s href=/games>← Games</a><h1>{{game.name}}</h1>
+<p class=s>Last completed: {{ 'Part-'~game.last_done if game.last_done else 'none' }} · Next: Part-{{game.next_part}}</p>
+<img id=im class=pv><p id=ti><b></b></p><p id=w class=warn></p>
+<label><input type=checkbox id=fin onchange=upd()> This is the final part</label>
+<label>Part number <input type=number id=pn min=1 value={{game.next_part}} oninput=upd()></label>
+<button id=ap onclick=go()>Start / Apply</button><ul id=st></ul>
+<a class=b2 href=/new?id={{game.id}}>Add / replace thumbnails</a>
+<button class=del onclick=del()>Delete game</button>
+<script>
+const ID={{game.id}},NAME={{game.name|tojson}};
+function mk(){const fp=fin.checked,n=+pn.value||1,s=' | PS5 Pro Gameplay | '+(fp?'Final Part':'Part-'+n);return{t:NAME.slice(0,100-s.length)+s,p:fp?'final':String(n)}}
+function upd(){const m=mk();ti.textContent=m.t;im.src='/thumb/'+ID+'/'+m.p}
+im.onerror=()=>{im.style.visibility='hidden';w.textContent='⚠ No thumbnail saved for this part'};
+im.onload=()=>{im.style.visibility='visible';w.textContent=''};
+upd();
+async function go(){ap.disabled=true;st.innerHTML='';
+ const r=await fetch('/api/apply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:ID,final:fin.checked,part:+pn.value||null})});
+ let j;try{j=await r.json()}catch(e){j={ok:false,error:'Server error '+r.status}}
+ for(const s of j.steps||[]){const li=document.createElement('li');li.textContent=(s.ok?'✓ ':'✗ ')+s.name;st.appendChild(li)}
+ const li=document.createElement('li');li.textContent=j.ok?j.message:'⚠ '+j.error;st.appendChild(li);
+ ap.disabled=false;if(j.ok&&!j.already)setTimeout(()=>location.reload(),3000)}
+async function del(){if(!confirm('Delete '+NAME+' and ALL its thumbnails? This cannot be undone.'))return;
+ const r=await(await fetch('/api/games/'+ID+'/delete',{method:'POST'})).json();if(r.ok)location='/games';else alert(r.error)}
+</script>"""
