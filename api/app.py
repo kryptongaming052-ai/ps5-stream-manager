@@ -1,6 +1,6 @@
 """Stage 1: Google sign-in + PS5 compatibility test page. Nothing is faked:
 every button returns the raw YouTube API response or the raw error."""
-import os, io, json
+import os, io, json, time
 from flask import Flask, session, redirect, request, jsonify, render_template_string
 from cryptography.fernet import Fernet
 from google_auth_oauthlib.flow import Flow
@@ -148,16 +148,23 @@ def playlist():
                   "status": {"privacyStatus": "public"}}).execute()["id"]
             created = True
         tok, dup = None, False
-        while True:
+        while not created:
             r = y.playlistItems().list(part="snippet", playlistId=pid, maxResults=50, pageToken=tok).execute()
             if any(i["snippet"]["resourceId"]["videoId"] == b["id"] for i in r["items"]): dup = True; break
             tok = r.get("nextPageToken")
             if not tok: break
         if dup: return {"playlist_id": pid, "created": created, "already_in_playlist": True}
-        item = y.playlistItems().insert(part="snippet", body={"snippet": {"playlistId": pid,
-               "resourceId": {"kind": "youtube#video", "videoId": b["id"]}}}).execute()
+        body = {"snippet": {"playlistId": pid, "resourceId": {"kind": "youtube#video", "videoId": b["id"]}}}
+        for attempt in range(4):
+            try:
+                item = y.playlistItems().insert(part="snippet", body=body).execute()
+                break
+            except HttpError as e:
+                if e.resp.status == 404 and created and attempt < 3:
+                    time.sleep(2)
+                    continue
+                raise
         return {"playlist_id": pid, "created": created, "already_in_playlist": False, "item": item}
-    return run(f)
 
 PAGE = """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
 <title>PS5 Stream Manager</title>
